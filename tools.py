@@ -85,8 +85,34 @@ async def _emit(tool_call: Dict[str, Any]) -> str:
     return "命令已发送到设备" if ok else _err("设备命令下发失败（连接不可用）")
 
 
+PHOTO_WAIT_TIMEOUT = 90.0
+
+
 async def handle_take_photo(args: Dict[str, Any], **_kw: Any) -> str:
-    return await _emit({"command": "take_photo"})
+    adapter = _adapter()
+    if adapter is None:
+        return _err("Rokid 设备未连接，无法下发命令")
+    ok = await adapter.send_tool_call({"command": "take_photo"})
+    if not ok:
+        return _err("设备命令下发失败（连接不可用）")
+    # Block THIS turn until the device sends the photo back. The photo plus its
+    # vision description become the tool result, so no premature answer is
+    # produced and no extra/self-initiated vision call is made; the model gives
+    # its single final reply after this returns.
+    result = await adapter.wait_for_photo(PHOTO_WAIT_TIMEOUT)
+    if not result or not result.get("paths"):
+        return (
+            "拍照命令已下发，但在等待时间内没有收到眼镜回传的照片（可能未拍摄或网络异常）。"
+            "请据此向用户说明拍照未完成，不要假设已拍到内容。"
+        )
+    paths = result["paths"]
+    description = result.get("description") or ""
+    desc_block = f"\n画面内容：{description}" if description else "\n（未能自动生成画面描述，必要时用 vision_analyze 结合该路径查看。）"
+    return (
+        "眼镜已完成拍照，照片已下载到本地：" + "；".join(paths) + desc_block +
+        "。用户最初的文字请求和这张照片现在合在一起处理：直接结合上述画面内容给出最终回复；"
+        "如用户要求保存，可直接使用该本地文件。不要描述拍照过程，不要让用户再次确认。"
+    )
 
 
 async def handle_take_navigation(args: Dict[str, Any], **_kw: Any) -> str:
@@ -126,7 +152,9 @@ TOOLS = (
      "📷",
      '向设备下发拍照命令。当用户要求拍照、拍摄、截图、看看周围、看看这个、拍一下，'
      '或用户提到图片但实际并未提供图片（如"这张照片怎么样""帮我看看这个"），'
-     '或用户想要记录眼前画面时调用。'),
+     '或用户想要记录眼前画面时调用。调用本工具时只输出工具调用本身，'
+     '不要在调用前后输出任何文字（如"好的""请对准画面"）；工具会等待照片并在'
+     '照片回来后由你给出最终回复。'),
     ("take_navigation", NAVIGATION_SCHEMA, handle_take_navigation,
      "🧭",
      "向设备下发导航命令。当用户想去某个地方、从A到B、问怎么走、问路线、"

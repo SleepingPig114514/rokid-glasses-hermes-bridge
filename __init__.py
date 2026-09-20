@@ -77,8 +77,12 @@ def register(ctx: Any) -> None:
         max_message_length=2000,
         emoji="👓",
         platform_hint=(
-            "你正通过 Rokid AR 眼镜对话。回复要简洁口语化，适合抬头显示和语音播报；"
-            "需要拍照、导航、建日程或结束对话时，使用对应的 rokid 设备工具，不要只口头描述。"
+            "你正通过 Rokid AR 眼镜对话，对方通过抬头显示阅读、用语音收听。"
+            "严格遵守：只回复最终结果，不要过程确认（如\"指令已发出\"\"请对准画面\"）、"
+            "不要展示思考过程、工具调用细节或 Markdown 排版；用自然口语表达，"
+            "像当面说话一样；需要解释清楚的问题可以正常展开，但只讲结论本身，"
+            "不要铺垫和客套。需要拍照、导航、建日程或结束对话时，使用对应的 rokid "
+            "设备工具，不要只口头描述。"
         ),
     )
 
@@ -92,7 +96,6 @@ def register(ctx: Any) -> None:
                 "parameters": parameters_schema,
             },
             handler=handler,
-            check_fn=_device_tool_available,
             is_async=True,
             description=description,
             emoji=emoji,

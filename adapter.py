@@ -16,10 +16,15 @@ Outbound (here -> cloud -> device):
                    agent_id, answer_stream, is_finish:false, type:"answer"}}
     finish:       {"event": "done",    "data": {...same..., answer_stream:"",
                    is_finish:true, type:"answer"}}
-    tool call:    {"event": "done",    "data": {role:"agent", message_id,
-                   agent_id, is_finish:true, type:"tool_call",
+    tool call:    {"event": "message", "data": {role:"agent", message_id,
+                   agent_id, is_finish:false, type:"tool_call",
                    tool_call:{command, ...}}}
     status:       {"type": "status", "connected": true}   # sent on open
+
+A device-command (tool_call) is a NON-terminal mid-turn frame: the request
+stays open, the device follows up on the same requestId (e.g. the photo), and
+the model's final answer closes the turn with the done frame. A fallback task
+sends the done frame if the device never follows up.
 
 This MVP sends the whole agent answer as one ``answer`` frame followed by a
 ``done`` frame (the official plugin's buffered fallback path); token-by-token
@@ -34,6 +39,7 @@ import logging
 import os
 import random
 import tempfile
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -58,6 +64,10 @@ DEFAULT_AGENT_ID = "main"
 RECONNECT_MAX_RETRIES = 10
 RECONNECT_BASE_DELAY = 1.0
 RECONNECT_MAX_DELAY = 30.0
+# After a terminal device-command frame, swallow the model's trailing answer text
+# for this many seconds. Cleared early by the next inbound frame (the device's
+# follow-up, e.g. the photo); TTL only covers the user abandoning the action.
+SUPPRESS_TTL_SECONDS = 120.0
 
 # Process-wide handle to the live adapter so the device-command tools can push
 # tool_call frames down the active socket. Single device account per profile for
@@ -69,6 +79,64 @@ def _backoff_delay(attempt: int) -> float:
     delay = RECONNECT_BASE_DELAY * (2 ** attempt)
     jitter = random.uniform(0, RECONNECT_BASE_DELAY)
     return min(delay + jitter, RECONNECT_MAX_DELAY)
+
+
+def _strip_reasoning(text: str) -> str:
+    """Remove the gateway's pre-send reasoning block so the glasses never see
+    chain-of-thought. Covers the three render styles produced by gateway
+    run_turn._hmwa_prepend_reasoning:
+
+      code:      "💭 **Reasoning:**\\n```\\n...\\n```\\n\\n<answer>"
+      blockquote: "> 💭 **Reasoning:**\\n> ...\\n\\n<answer>"
+      subtext:   "-# 💭 Reasoning\\n-# ...\\n\\n<answer>"
+
+    Best-effort format matching: an unrecognized shape is returned untouched
+    (worst case the reasoning shows; never crash or drop the real answer).
+    """
+    if not text or "Reasoning" not in text:
+        return text
+
+    lines = text.split("\n")
+    # Identify the first line that opens a reasoning block.
+    header_idx = next(
+        (
+            i for i, ln in enumerate(lines)
+            if ln.lstrip().startswith("💭 **Reasoning:**")
+            or ln.lstrip().startswith("> 💭 **Reasoning:**")
+            or ln.lstrip().startswith("-# 💭 Reasoning")
+        ),
+        None,
+    )
+    if header_idx is None:
+        return text
+
+    first = lines[header_idx].lstrip()
+    body_lines: List[str] = []
+
+    if first.startswith("💭 **Reasoning:**"):
+        # Code style: header then a fenced block on the following lines.
+        i = header_idx + 1
+        if i < len(lines) and lines[i].strip().startswith("```"):
+            i += 1  # opening fence
+            while i < len(lines) and not lines[i].strip().startswith("```"):
+                i += 1
+            i += 1  # closing fence (if present)
+        else:
+            return text  # malformed; leave untouched
+        body_lines = lines[i:]
+    elif first.startswith("> 💭 **Reasoning:**"):
+        i = header_idx + 1
+        while i < len(lines) and (lines[i].lstrip().startswith(">") or not lines[i].strip()):
+            i += 1
+        body_lines = lines[i:]
+    else:  # -# subtext
+        i = header_idx + 1
+        while i < len(lines) and (lines[i].lstrip().startswith("-#") or not lines[i].strip()):
+            i += 1
+        body_lines = lines[i:]
+
+    result = "\n".join(body_lines).lstrip("\n")
+    return result or text
 
 
 class RokidBridgeAdapter(BasePlatformAdapter):
@@ -97,6 +165,19 @@ class RokidBridgeAdapter(BasePlatformAdapter):
         self._stopping = False
         # Stable chat (sessionKey/linkCode) -> latest inbound requestId awaiting a reply.
         self._pending_request: Dict[str, str] = {}
+        # Chats whose turn is paused on a device-command frame awaiting the
+        # device's follow-up (e.g. the photo); value is the monotonic deadline
+        # until which outbound answer text is swallowed.
+        self._suppressed_until: Dict[str, float] = {}
+        # Tasks that close the paused turn with a done frame if the device
+        # never follows up (user abandoned the action).
+        self._suppress_tasks: Dict[str, "asyncio.Task[None]"] = {}
+        # Device-command tools block here awaiting the device's follow-up image
+        # frame. Tools run in a worker thread (model_tools._run_async), so the
+        # signal is a threading.Event carrying the downloaded-photo result;
+        # the image frame resolves it instead of dispatching a new turn, making
+        # the photo the tool result on the same turn.
+        self._photo_waits: Dict[str, Dict[str, Any]] = {}
         self._send_lock = asyncio.Lock()
 
     # ------------------------------------------------------------------ config
@@ -152,6 +233,14 @@ class RokidBridgeAdapter(BasePlatformAdapter):
             except Exception:
                 pass
         self._session = None
+        for wait in self._photo_waits.values():
+            wait["event"].set()
+        self._photo_waits.clear()
+        for task in self._suppress_tasks.values():
+            if not task.done():
+                task.cancel()
+        self._suppress_tasks.clear()
+        self._suppressed_until.clear()
         if _active_adapter is self:
             _active_adapter = None
         self._mark_disconnected()
@@ -249,9 +338,37 @@ class RokidBridgeAdapter(BasePlatformAdapter):
             return
 
         chat_id = str(session_key).strip() if session_key else self._chat_id
+
+        # If a device-command tool on this chat is blocked waiting for the
+        # photo, an image frame resolves that wait instead of starting a new
+        # turn, so the photo becomes the tool result on the same turn.
+        photo_wait = self._photo_waits.get(chat_id)
+        if photo_wait is not None and image_urls:
+            media_paths: List[str] = []
+            for url in image_urls:
+                path = await self._download_media(url, request_id)
+                if path:
+                    media_paths.append(path)
+            if media_paths:
+                logger.info("resolving photo wait requestId=%s chat=%s", request_id, chat_id)
+                # Turn resumes inside the tool — drop suppression/close tasks.
+                self._release_suppression(chat_id)
+                # Auto-describe via the configured vision backend (qwen omni,
+                # ~2s) so the model sees the content as the tool result without
+                # making its own slow vision call. Best-effort: keep the path.
+                description = await self._describe_photo(media_paths)
+                photo_wait["paths"] = media_paths
+                photo_wait["description"] = description
+                photo_wait["event"].set()
+                return
+            logger.warning("photo frame download failed; falling through to normal dispatch")
+
+        # A new inbound frame resumes any earlier paused turn — release
+        # suppression and cancel the abandonment close task.
+        self._release_suppression(chat_id)
         self._pending_request[chat_id] = request_id
 
-        media_paths: List[str] = []
+        media_paths = []
         media_types: List[str] = []
         for url in image_urls:
             path = await self._download_media(url, request_id)
@@ -305,6 +422,37 @@ class RokidBridgeAdapter(BasePlatformAdapter):
             logger.warning("[rokid] image download failed (%s): %s", url, exc)
             return None
 
+    # ------------------------------------------------- turn suppression
+    def _release_suppression(self, chat_id: str) -> None:
+        """Turn resumed (device follow-up arrived): stop swallowing answers and
+        cancel the scheduled abandonment close."""
+        self._suppressed_until.pop(str(chat_id), None)
+        task = self._suppress_tasks.pop(str(chat_id), None)
+        if task is not None and not task.done():
+            task.cancel()
+
+    def _is_suppressed(self, chat_id: str) -> bool:
+        """True while this chat is paused on a device-command frame, when the
+        model's trailing answer text must not reach the device. A background
+        task owns the deadline; this only reads the flag."""
+        return str(chat_id) in self._suppressed_until
+
+    async def _close_abandoned_turn(self, chat_id: str, request_id: str, delay: float) -> None:
+        """Fallback net: if the device never sends the follow-up frame, close
+        its waiting request with a done frame so the turn does not hang."""
+        try:
+            await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            return
+        if self._pending_request.get(str(chat_id)) != request_id:
+            return
+        self._suppressed_until.pop(str(chat_id), None)
+        self._suppress_tasks.pop(str(chat_id), None)
+        logger.info("[rokid] no device follow-up on chat=%s; closing turn with done", chat_id)
+        await self._send_json(self._answer_frame(request_id, "", True))
+        if self._pending_request.get(str(chat_id)) == request_id:
+            self._pending_request.pop(str(chat_id), None)
+
     # ------------------------------------------------------------- outbound send
     async def _send_json(self, frame: Dict[str, Any]) -> bool:
         async with self._send_lock:
@@ -339,11 +487,21 @@ class RokidBridgeAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> SendResult:
+        # Paused on a device-command frame (awaiting the photo): swallow the
+        # model's trailing text so the device stays silent until its follow-up.
+        # Report success so the gateway neither retries nor surfaces an error.
+        if self._is_suppressed(str(chat_id)):
+            logger.info("[rokid] suppressed trailing answer on chat=%s", chat_id)
+            return SendResult(success=True, message_id=self._pending_request.get(str(chat_id)))
         request_id = self._pending_request.get(str(chat_id))
         if not request_id:
             return SendResult(success=False, error="no pending device request for this chat")
         text = content or ""
         if text:
+            # Glasses must never display chain-of-thought: strip the gateway's
+            # pre-send reasoning block here (this adapter only -> this platform
+            # only; other platforms are untouched).
+            text = _strip_reasoning(text)
             if not await self._send_json(self._answer_frame(request_id, text, False)):
                 return SendResult(success=False, error="socket send failed", retryable=True)
         if not await self._send_json(self._answer_frame(request_id, "", True)):
@@ -352,6 +510,8 @@ class RokidBridgeAdapter(BasePlatformAdapter):
 
     async def send_answer(self, chat_id: str, content: str) -> bool:
         """Helper used by device tools / future streaming paths."""
+        if self._is_suppressed(str(chat_id)):
+            return True
         request_id = self._pending_request.get(str(chat_id))
         if not request_id:
             return False
@@ -360,28 +520,87 @@ class RokidBridgeAdapter(BasePlatformAdapter):
     async def send_tool_call(self, tool_call: Dict[str, Any], chat_id: Optional[str] = None) -> bool:
         """Push a device command frame (take_photo / navigation / calendar / exit).
 
-        A tool_call is terminal: it carries is_finish=true and closes the turn.
+        Per the protocol contract (protocol.ts WsBridgeToolCallFrame) this is a
+        NON-terminal mid-turn frame: ``event:"message"`` / ``is_finish:false``.
+        The device runs the command and sends its follow-up (e.g. the photo) as
+        the next inbound frame on the SAME requestId; the model's final answer
+        then closes the turn with the normal done frame. Keeping the request
+        open is what lets the glasses display that final reply.
         """
-        target_chat = chat_id or self._chat_id
-        request_id = self._pending_request.get(str(target_chat))
+        target_chat = str(chat_id or self._chat_id)
+        request_id = self._pending_request.get(target_chat)
         if not request_id:
             logger.warning("[rokid] cannot emit tool_call; no pending request on %s", target_chat)
             return False
         frame = {
-            "event": "done",
+            "event": "message",
             "data": {
                 "role": "agent",
                 "message_id": request_id,
                 "agent_id": self.agent_id,
-                "is_finish": True,
+                "is_finish": False,
                 "type": "tool_call",
                 "tool_call": tool_call,
             },
         }
         ok = await self._send_json(frame)
         if ok:
-            self._pending_request.pop(str(target_chat), None)
+            # Pause the turn: swallow the model's trailing text until the
+            # device follows up. Replace any earlier pause (same requestId can
+            # carry corrected transcript frames); keep _pending_request so the
+            # eventual answer is deliverable on this still-open request.
+            old_task = self._suppress_tasks.pop(target_chat, None)
+            if old_task is not None and not old_task.done():
+                old_task.cancel()
+            self._suppressed_until[target_chat] = time.monotonic() + SUPPRESS_TTL_SECONDS
+            self._suppress_tasks[target_chat] = asyncio.create_task(
+                self._close_abandoned_turn(target_chat, request_id, SUPPRESS_TTL_SECONDS)
+            )
         return ok
+
+    async def _describe_photo(self, paths: List[str]) -> str:
+        """Run the system vision enrichment (configured auxiliary.vision) on the
+        downloaded photo and return its description; empty string on failure."""
+        prompt = (
+            "用2-4句话简洁描述这张图片，说明主体、关键文字/数据和整体场景。"
+            "如果是图表，包含重要标签和数值。"
+        )
+        parts: List[str] = []
+        try:
+            from tools.vision_tools import vision_analyze_tool
+            from agent.memory_manager import sanitize_context
+            for p in paths:
+                raw = await vision_analyze_tool(image_url=p, user_prompt=prompt)
+                obj = json.loads(raw)
+                if obj.get("success") and obj.get("analysis"):
+                    parts.append(sanitize_context(obj["analysis"]))
+        except Exception:
+            logger.debug("vision enrichment failed", exc_info=True)
+        return "\n".join(parts)
+
+    async def wait_for_photo(self, timeout: float) -> Optional[Dict[str, Any]]:
+        """Block the calling device-command tool until the device's follow-up
+        image frame arrives, returning the downloaded photo path(s); returns
+        None on timeout (photo never came). Runs in a worker thread, so the
+        blocking wait does not stall the gateway event loop."""
+        chat_id = self._chat_id
+        wait: Dict[str, Any] = {"event": threading.Event(), "paths": []}
+        # A corrected-transcript frame could re-enter; reuse the existing wait.
+        existing = self._photo_waits.get(chat_id)
+        if existing is not None:
+            wait = existing
+        else:
+            self._photo_waits[chat_id] = wait
+        try:
+            if await asyncio.to_thread(wait["event"].wait, timeout):
+                return {
+                    "paths": list(wait.get("paths") or []),
+                    "description": str(wait.get("description") or ""),
+                }
+            return None
+        finally:
+            if self._photo_waits.get(chat_id) is wait:
+                self._photo_waits.pop(chat_id, None)
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         return {"name": f"Rokid {self.link_code}", "type": "dm"}
