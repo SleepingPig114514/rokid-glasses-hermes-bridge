@@ -1,0 +1,43 @@
+name: rokid-glasses-hermes-bridge
+label: Rokid Glasses Hermes Bridge
+kind: platform
+version: 1.0.0
+description: >
+  Bridge adapter connecting the official Rokid OpenClaw plugin to Hermes Agent.
+  This plugin does NOT replace the official Rokid RCS WebSocket bridge — it
+  relays messages between the official OpenClaw gateway (wss://rcs.rokid.com/claw/ws/link)
+  and Hermes, enabling AR glasses voice/text/photo input and agent answer/tool commands output.
+  Requires the official Rokid OpenClaw plugin credentials (linkCode/linkSecret).
+author: custom
+repository: TBD
+homepage: TBD
+tags:
+  - rokid
+  - ar-glasses
+  - openclaw-bridge
+  - platform-adapter
+dependencies:
+  - aiohttp>=3.9.0
+provides_tools:
+  - take_photo
+  - take_navigation
+  - control_calendar
+  - notify_agent_off
+requires_env:
+  - name: ROKID_LINK_CODE
+    description: "Device pairing link code shown on the Rokid glasses (from official OpenClaw plugin)"
+    prompt: "Rokid link code"
+    password: false
+  - name: ROKID_LINK_SECRET
+    description: "Device pairing link secret (from official OpenClaw plugin)"
+    prompt: "Rokid link secret"
+    password: true
+optional_env:
+  - name: ROKID_WS_URL
+    description: "Rokid RCS WebSocket endpoint (default wss://rcs.rokid.com/claw/ws/link)"
+    prompt: "Rokid WS URL"
+    password: false
+  - name: ROKID_AGENT_ID
+    description: "agent_id reported in outbound frames (default main)"
+    prompt: "Agent id"
+    password: false
