@@ -191,7 +191,7 @@ rokid-glasses-hermes-bridge/
 ## 🔗 相关资源
 
 - [Hermes Agent 文档](https://hermes-agent.nousresearch.com/docs)
-- [Rokid OpenClaw 官方插件](https://github.com/rokid/rokid-openclaw-gateway-compatible)（需确认实际仓库地址）
+- [Rokid OpenClaw 官方插件](https://gitee.com/rokid-eco/rokid-openclaw-gateway-compatible)
 - [Hermes 平台适配器开发指南](https://hermes-agent.nousresearch.com/docs/gateway/platform-adapters)
 
 ## 📄 许可证

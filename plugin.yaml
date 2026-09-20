@@ -9,8 +9,8 @@ description: >
   and Hermes, enabling AR glasses voice/text/photo input and agent answer/tool commands output.
   Requires the official Rokid OpenClaw plugin credentials (linkCode/linkSecret).
 author: custom
-repository: TBD
-homepage: TBD
+repository: https://gitee.com/rokid-eco/rokid-glasses-hermes-bridge
+homepage: https://gitee.com/rokid-eco/rokid-glasses-hermes-bridge
 tags:
   - rokid
   - ar-glasses
