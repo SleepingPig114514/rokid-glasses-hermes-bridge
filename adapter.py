@@ -68,6 +68,13 @@ RECONNECT_MAX_DELAY = 30.0
 # for this many seconds. Cleared early by the next inbound frame (the device's
 # follow-up, e.g. the photo); TTL only covers the user abandoning the action.
 SUPPRESS_TTL_SECONDS = 120.0
+# Glasses-side request timer (~30s). On-device test: with the "…" heartbeat
+# running the glasses showed NO timeout banner and the session stayed alive —
+# keep beating while thinking and never close early, so the (possibly very
+# late) real answer still renders. Beat every HEARTBEAT_SECONDS, for at most
+# HEARTBEAT_MAX_SECONDS (user choice: ~10 min, manual exit on device beyond).
+HEARTBEAT_SECONDS = 8.0
+HEARTBEAT_MAX_SECONDS = 600.0
 
 # Process-wide handle to the live adapter so the device-command tools can push
 # tool_call frames down the active socket. Single device account per profile for
@@ -93,7 +100,10 @@ def _strip_reasoning(text: str) -> str:
     Best-effort format matching: an unrecognized shape is returned untouched
     (worst case the reasoning shows; never crash or drop the real answer).
     """
-    if not text or "Reasoning" not in text:
+    # Labels come from the gateway's i18n (locales/*.yaml): English
+    # "💭 **Reasoning:**" or Chinese "💭 **推理：**" (+ per-platform quote/discord
+    # variants). Match any locale by the 💭 marker instead of the English word.
+    if not text or "💭" not in text:
         return text
 
     lines = text.split("\n")
@@ -104,6 +114,9 @@ def _strip_reasoning(text: str) -> str:
             if ln.lstrip().startswith("💭 **Reasoning:**")
             or ln.lstrip().startswith("> 💭 **Reasoning:**")
             or ln.lstrip().startswith("-# 💭 Reasoning")
+            or ln.lstrip().startswith("💭 **推理：**")
+            or ln.lstrip().startswith("> 💭 **推理：**")
+            or ln.lstrip().startswith("-# 💭 推理")
         ),
         None,
     )
@@ -113,7 +126,7 @@ def _strip_reasoning(text: str) -> str:
     first = lines[header_idx].lstrip()
     body_lines: List[str] = []
 
-    if first.startswith("💭 **Reasoning:**"):
+    if first.startswith("💭 **Reasoning:**") or first.startswith("💭 **推理：**"):
         # Code style: header then a fenced block on the following lines.
         i = header_idx + 1
         if i < len(lines) and lines[i].strip().startswith("```"):
@@ -137,6 +150,17 @@ def _strip_reasoning(text: str) -> str:
 
     result = "\n".join(body_lines).lstrip("\n")
     return result or text
+
+
+def _is_bare_wake_word(text: str) -> bool:
+    """True when the utterance is just the wake word, tolerating speech
+    fillers ("呃/嗯/那个/就是..." ) and punctuation the glasses' ASR adds.
+    Deterministic string rule, no model call. Anything carrying real content
+    ("龙虾助手，今天天气") returns False and is answered normally."""
+    import re
+    t = re.sub(r"[\s，。、？！?!,.~～…]+", "", text)
+    t = re.sub(r"(呃|嗯+|啊|哦|噢|唉|那个|那|就是|然后|接着|哎|喂+)", "", t)
+    return t in {"龙虾助手", "乐奇龙虾助手", "龙虾", "龙虾助手啊"}
 
 
 class RokidBridgeAdapter(BasePlatformAdapter):
@@ -165,6 +189,19 @@ class RokidBridgeAdapter(BasePlatformAdapter):
         self._stopping = False
         # Stable chat (sessionKey/linkCode) -> latest inbound requestId awaiting a reply.
         self._pending_request: Dict[str, str] = {}
+        # True while a dispatched turn for this chat awaits its final answer;
+        # follow-ups arriving meanwhile queue instead of interrupting.
+        self._turn_active: Dict[str, bool] = {}
+        self._queued_turn: Dict[str, Dict[str, Any]] = {}
+        self._queue_tasks: Dict[str, "asyncio.Task[None]"] = {}
+        # Chats whose inbound request was already closed by the two-stage ack
+        # ("请稍后……" + done frame); the real answer goes out as an
+        # agent-initiated push frame instead of on the closed request.
+        self._request_closed: Dict[str, bool] = {}
+        self._push_seq: Dict[str, int] = {}
+        # Watchdog tasks that close a still-open request with a done frame
+        # before the glasses' own ~30s timer fires (see SLOW_CLOSE_SECONDS).
+        self._slow_close_tasks: Dict[str, "asyncio.Task[None]"] = {}
         # Chats whose turn is paused on a device-command frame awaiting the
         # device's follow-up (e.g. the photo); value is the monotonic deadline
         # until which outbound answer text is swallowed.
@@ -339,9 +376,24 @@ class RokidBridgeAdapter(BasePlatformAdapter):
 
         chat_id = str(session_key).strip() if session_key else self._chat_id
 
+        # Bare wake word ("龙虾助手" ± filler words/punctuation) is a device-side
+        # wake event, not a question: acknowledge silently (close the request
+        # with a done frame, no text) so the glasses never voice a reply.
+        if not image_urls and _is_bare_wake_word(text):
+            logger.info("[rokid] bare wake word on chat=%s; silent close", chat_id)
+            await self._send_json(self._answer_frame(request_id, "", True))
+            return
+
+        await self._start_turn(chat_id, text, image_urls, request_id, session_key)
+
+    async def _start_turn(
+        self, chat_id: str, text: str, image_urls: List[str], request_id: str,
+        session_key: Optional[str],
+    ) -> None:
         # If a device-command tool on this chat is blocked waiting for the
         # photo, an image frame resolves that wait instead of starting a new
-        # turn, so the photo becomes the tool result on the same turn.
+        # turn, so the photo becomes the tool result on the same turn. This
+        # takes precedence over the queue below.
         photo_wait = self._photo_waits.get(chat_id)
         if photo_wait is not None and image_urls:
             media_paths: List[str] = []
@@ -363,10 +415,44 @@ class RokidBridgeAdapter(BasePlatformAdapter):
                 return
             logger.warning("photo frame download failed; falling through to normal dispatch")
 
+        # A turn is already running for this chat: do NOT hand the new message
+        # to the gateway (that would interrupt it and swallow the running
+        # answer). Queue locally; send() drains this after the answer lands.
+        if self._turn_active.get(chat_id):
+            logger.info("[rokid] turn busy on chat=%s; queued follow-up %s", chat_id, request_id)
+            self._queued_turn[chat_id] = {
+                "text": text, "image_urls": image_urls,
+                "request_id": request_id, "session_key": session_key,
+            }
+            # Failsafe: if the running turn dies without ever answering (no
+            # send() will drain the queue), dispatch it directly after a while.
+            old = self._queue_tasks.pop(chat_id, None)
+            if old is not None and not old.done():
+                old.cancel()
+            self._queue_tasks[chat_id] = asyncio.create_task(
+                self._queued_turn_failsafe(chat_id, request_id)
+            )
+            return
+
         # A new inbound frame resumes any earlier paused turn — release
         # suppression and cancel the abandonment close task.
         self._release_suppression(chat_id)
         self._pending_request[chat_id] = request_id
+        self._push_seq[chat_id] = 0
+        self._request_closed[chat_id] = False
+
+        # Arm the heartbeat: while the model is still thinking, a short "…"
+        # chunk is pushed every HEARTBEAT_SECONDS on the open request. It never
+        # sends a done frame — on-device tests showed a late answer still
+        # renders as long as the request stays open, while an early close makes
+        # every later frame (including the real answer) invisible. Fast answers
+        # cancel it before the first beat.
+        old_task = self._slow_close_tasks.pop(chat_id, None)
+        if old_task is not None and not old_task.done():
+            old_task.cancel()
+        self._slow_close_tasks[chat_id] = asyncio.create_task(
+            self._slow_answer_watchdog(chat_id, request_id)
+        )
 
         media_paths = []
         media_types: List[str] = []
@@ -396,7 +482,34 @@ class RokidBridgeAdapter(BasePlatformAdapter):
             metadata={"request_id": request_id, "session_key": session_key},
         )
         logger.info("[rokid] dispatch requestId=%s chat=%s images=%d", request_id, chat_id, len(media_paths))
+        self._turn_active[chat_id] = True
         await self.handle_message(event)
+
+    def _finish_turn(self, chat_id: str) -> None:
+        """A final answer (or an early abort frame) ended this chat's turn."""
+        self._turn_active.pop(chat_id, None)
+        task = self._queue_tasks.pop(chat_id, None)
+        if task is not None and not task.done():
+            task.cancel()
+
+    async def _queued_turn_failsafe(self, chat_id: str, request_id: str) -> None:
+        """If the running turn never produced an answer (crash, gateway abort
+        without a send()), do not strand the queued follow-up forever."""
+        try:
+            await asyncio.sleep(SUPPRESS_TTL_SECONDS)
+        except asyncio.CancelledError:
+            return
+        self._queue_tasks.pop(chat_id, None)
+        if not self._turn_active.get(chat_id):
+            return  # send() already drained (or will)
+        queued = self._queued_turn.pop(chat_id, None)
+        if queued and queued["request_id"] == request_id:
+            logger.info("[rokid] turn silent past TTL; force-dispatching queue %s", request_id)
+            self._finish_turn(chat_id)
+            await self._start_turn(
+                chat_id, queued["text"], queued["image_urls"],
+                queued["request_id"], queued["session_key"],
+            )
 
     async def _download_media(self, url: str, request_id: str) -> Optional[str]:
         if not (url.startswith("http://") or url.startswith("https://")):
@@ -436,6 +549,28 @@ class RokidBridgeAdapter(BasePlatformAdapter):
         model's trailing answer text must not reach the device. A background
         task owns the deadline; this only reads the flag."""
         return str(chat_id) in self._suppressed_until
+
+    async def _slow_answer_watchdog(self, chat_id: str, request_id: str) -> None:
+        """Heartbeat while the model is still thinking: every HEARTBEAT_SECONDS
+        push a short non-terminal chunk ("…") on the open request. NEVER sends
+        the terminal done frame — test evidence on-device shows a late answer
+        still renders as long as the request stays open, and an early close
+        makes every later frame (including the real answer) invisible.
+        Cancelled by send() when the real answer arrives; bounded by a max
+        duration so a dead turn cannot spam the socket forever."""
+        deadline = time.monotonic() + HEARTBEAT_MAX_SECONDS
+        try:
+            while time.monotonic() < deadline:
+                await asyncio.sleep(HEARTBEAT_SECONDS)
+                if self._pending_request.get(str(chat_id)) != request_id:
+                    return  # answered, or superseded by a newer request
+                if self._is_suppressed(str(chat_id)):
+                    return  # device-command flow (photo) owns this turn
+                if not await self._send_json(self._answer_frame(request_id, "…", False)):
+                    return  # socket gone
+        except asyncio.CancelledError:
+            return
+        self._slow_close_tasks.pop(str(chat_id), None)
 
     async def _close_abandoned_turn(self, chat_id: str, request_id: str, delay: float) -> None:
         """Fallback net: if the device never sends the follow-up frame, close
@@ -479,6 +614,12 @@ class RokidBridgeAdapter(BasePlatformAdapter):
             },
         }
 
+    def _push_id(self, chat_id: str) -> str:
+        """Synthetic message_id for agent-initiated pushes (late answers)."""
+        chat_id = str(chat_id)
+        self._push_seq[chat_id] = self._push_seq.get(chat_id, 0) + 1
+        return f"push-{chat_id}-{int(time.time() * 1000)}-{self._push_seq[chat_id]}"
+
     async def send(
         self,
         chat_id: str,
@@ -493,17 +634,71 @@ class RokidBridgeAdapter(BasePlatformAdapter):
         if self._is_suppressed(str(chat_id)):
             logger.info("[rokid] suppressed trailing answer on chat=%s", chat_id)
             return SendResult(success=True, message_id=self._pending_request.get(str(chat_id)))
-        request_id = self._pending_request.get(str(chat_id))
-        if not request_id:
-            return SendResult(success=False, error="no pending device request for this chat")
         text = content or ""
         if text:
             # Glasses must never display chain-of-thought: strip the gateway's
             # pre-send reasoning block here (this adapter only -> this platform
             # only; other platforms are untouched).
             text = _strip_reasoning(text)
+        # Swallow gateway status prose — "↪ 已重定向当前运行…" steering notices
+        # and "⏳ 正在处理——N 分钟…" long-running heartbeats are internal state,
+        # not answers; the glasses would voice them. The real answer arrives
+        # on this still-open request later. (Checked BEFORE the interim branch:
+        # these notices carry _interim_send themselves.)
+        stripped = text.lstrip()
+        if stripped.startswith("↪") or stripped.startswith("⏳"):
+            logger.info("[rokid] suppressed status notice on chat=%s", chat_id)
+            return SendResult(success=True, message_id=self._pending_request.get(str(chat_id)))
+        # Mid-turn interim commentary (gateway marks it _interim_send): deliver
+        # the text as a non-terminal chunk but NEVER close the request — the
+        # turn-final answer is still coming and a done frame here would make
+        # the device ignore it (observed: "任务中途插一句话，后面的正式回复
+        # 就没了"). Fast answers never hit this path.
+        if (metadata or {}).get("_interim_send"):
+            request_id = self._pending_request.get(str(chat_id))
+            if request_id and text:
+                await self._send_json(self._answer_frame(request_id, text + "\n\n", False))
+            return SendResult(success=True, message_id=request_id)
+
+        if self._request_closed.get(str(chat_id)):
+            # The watchdog already closed this request before the glasses' own
+            # timer fired; deliver the late answer as an agent-initiated push
+            # (fresh message_id, message frame + done frame).
+            self._request_closed.pop(str(chat_id), None)
+            push_id = self._push_id(chat_id)
+            if text and not await self._send_json(self._answer_frame(push_id, text, False)):
+                return SendResult(success=False, error="socket send failed", retryable=True)
+            if not await self._send_json(self._answer_frame(push_id, "", True)):
+                return SendResult(success=False, error="socket done-frame failed", retryable=True)
+            return SendResult(success=True, message_id=push_id)
+
+        request_id = self._pending_request.get(str(chat_id))
+        if not request_id:
+            return SendResult(success=False, error="no pending device request for this chat")
+        # Answer is here: cancel the heartbeat so it does not race us.
+        task = self._slow_close_tasks.pop(str(chat_id), None)
+        if task is not None and not task.done():
+            task.cancel()
+        if text:
             if not await self._send_json(self._answer_frame(request_id, text, False)):
                 return SendResult(success=False, error="socket send failed", retryable=True)
+        # Turn complete: clear the busy flag.
+        self._finish_turn(str(chat_id))
+        queued = self._queued_turn.pop(str(chat_id), None)
+        if queued:
+            # A follow-up queued while we ran. Do NOT send the done frame:
+            # the glasses ignore every frame after done on a request, which
+            # would make the queued turn's answer invisible (both messages
+            # share one requestId per wake session). Keep the request open,
+            # append a separator, and run the queued turn on the SAME request;
+            # its answer closes it. The two answers render in one bubble.
+            logger.info("[rokid] queued follow-up continues request %s (no done yet)", request_id)
+            await self._send_json(self._answer_frame(request_id, "\n\n", False))
+            await self._start_turn(
+                str(chat_id), queued["text"], queued["image_urls"],
+                queued["request_id"], queued["session_key"],
+            )
+            return SendResult(success=True, message_id=request_id)
         if not await self._send_json(self._answer_frame(request_id, "", True)):
             return SendResult(success=False, error="socket done-frame failed", retryable=True)
         return SendResult(success=True, message_id=request_id)
